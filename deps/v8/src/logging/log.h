@@ -247,7 +247,7 @@ class Logger : public CodeEventListener {
 
   V8_EXPORT_PRIVATE void TimerEvent(StartEnd se, const char* name);
 
-  void BasicBlockCounterEvent(const char* name, int block_id, uint32_t count);
+  void BasicBlockCounterEvent(const char* name, int block_id, double count);
 
   void BuiltinHashEvent(const char* name, int hash);
 
@@ -313,6 +313,8 @@ class Logger : public CodeEventListener {
   // Logs a scripts sources. Keeps track of all logged scripts to ensure that
   // each script is logged only once.
   bool EnsureLogScriptSource(Script script);
+
+  int64_t Time();
 
   Isolate* isolate_;
 

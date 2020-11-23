@@ -4531,7 +4531,7 @@ UNINITIALIZED_TEST(LoadedAtStartupScripts) {
                       v8_bool(false));
     std::unordered_map<int, int> count_by_type;
     {
-      i::DisallowHeapAllocation no_gc;
+      i::DisallowGarbageCollection no_gc;
       i::Script::Iterator iterator(i_isolate);
       for (i::Script script = iterator.Next(); !script.is_null();
            script = iterator.Next()) {
@@ -4859,7 +4859,6 @@ TEST(GetPrivateFields) {
 }
 
 TEST(GetPrivateMethodsAndAccessors) {
-  i::FLAG_harmony_private_methods = true;
   LocalContext env;
   v8::Isolate* v8_isolate = CcTest::isolate();
   v8::HandleScope scope(v8_isolate);
@@ -4996,7 +4995,6 @@ TEST(GetPrivateMethodsAndAccessors) {
 }
 
 TEST(GetPrivateStaticMethodsAndAccessors) {
-  i::FLAG_harmony_private_methods = true;
   LocalContext env;
   v8::Isolate* v8_isolate = CcTest::isolate();
   v8::HandleScope scope(v8_isolate);
@@ -5047,7 +5045,6 @@ TEST(GetPrivateStaticMethodsAndAccessors) {
 }
 
 TEST(GetPrivateStaticAndInstanceMethodsAndAccessors) {
-  i::FLAG_harmony_private_methods = true;
   LocalContext env;
   v8::Isolate* v8_isolate = CcTest::isolate();
   v8::HandleScope scope(v8_isolate);

@@ -30,6 +30,7 @@
 #include "src/base/logging.h"
 #include "src/base/platform/platform.h"
 #include "src/base/platform/time.h"
+#include "src/base/platform/wrappers.h"
 #include "src/base/sys-info.h"
 #include "src/d8/d8-console.h"
 #include "src/d8/d8-platforms.h"
@@ -487,7 +488,7 @@ ScriptCompiler::CachedData* Shell::LookupCodeCache(Isolate* isolate,
   if (entry != cached_code_map_.end() && entry->second) {
     int length = entry->second->length;
     uint8_t* cache = new uint8_t[length];
-    memcpy(cache, entry->second->data, length);
+    base::Memcpy(cache, entry->second->data, length);
     ScriptCompiler::CachedData* cached_data = new ScriptCompiler::CachedData(
         cache, length, ScriptCompiler::CachedData::BufferOwned);
     return cached_data;
@@ -504,7 +505,7 @@ void Shell::StoreInCodeCache(Isolate* isolate, Local<Value> source,
   DCHECK(*key);
   int length = cache_data->length;
   uint8_t* cache = new uint8_t[length];
-  memcpy(cache, cache_data->data, length);
+  base::Memcpy(cache, cache_data->data, length);
   cached_code_map_[*key] = std::unique_ptr<ScriptCompiler::CachedData>(
       new ScriptCompiler::CachedData(cache, length,
                                      ScriptCompiler::CachedData::BufferOwned));
@@ -540,8 +541,8 @@ class StreamingCompileTask final : public v8::Task {
   StreamingCompileTask(Isolate* isolate,
                        v8::ScriptCompiler::StreamedSource* streamed_source)
       : isolate_(isolate),
-        script_streaming_task_(v8::ScriptCompiler::StartStreamingScript(
-            isolate, streamed_source)) {
+        script_streaming_task_(
+            v8::ScriptCompiler::StartStreaming(isolate, streamed_source)) {
     Shell::NotifyStartStreamingTask(isolate_);
   }
 
@@ -835,7 +836,8 @@ MaybeLocal<Module> ResolveModuleCallback(Local<Context> context,
 
 }  // anonymous namespace
 
-MaybeLocal<Module> Shell::FetchModuleTree(Local<Context> context,
+MaybeLocal<Module> Shell::FetchModuleTree(Local<Module> referrer,
+                                          Local<Context> context,
                                           const std::string& file_name) {
   DCHECK(IsAbsolutePath(file_name));
   Isolate* isolate = context->GetIsolate();
@@ -848,8 +850,16 @@ MaybeLocal<Module> Shell::FetchModuleTree(Local<Context> context,
       source_text = ReadFile(isolate, fallback_file_name.c_str());
     }
   }
+
+  ModuleEmbedderData* d = GetModuleDataFromContext(context);
   if (source_text.IsEmpty()) {
-    std::string msg = "d8: Error reading module from " + file_name;
+    std::string msg = "d8: Error reading  module from " + file_name;
+    if (!referrer.IsEmpty()) {
+      auto specifier_it =
+          d->module_to_specifier_map.find(Global<Module>(isolate, referrer));
+      CHECK(specifier_it != d->module_to_specifier_map.end());
+      msg += "\n    imported by " + specifier_it->second;
+    }
     Throw(isolate, msg.c_str());
     return MaybeLocal<Module>();
   }
@@ -863,7 +873,6 @@ MaybeLocal<Module> Shell::FetchModuleTree(Local<Context> context,
     return MaybeLocal<Module>();
   }
 
-  ModuleEmbedderData* d = GetModuleDataFromContext(context);
   CHECK(d->specifier_to_module_map
             .insert(std::make_pair(file_name, Global<Module>(isolate, module)))
             .second);
@@ -878,7 +887,7 @@ MaybeLocal<Module> Shell::FetchModuleTree(Local<Context> context,
     std::string absolute_path =
         NormalizePath(ToSTLString(isolate, name), dir_name);
     if (d->specifier_to_module_map.count(absolute_path)) continue;
-    if (FetchModuleTree(context, absolute_path).IsEmpty()) {
+    if (FetchModuleTree(module, context, absolute_path).IsEmpty()) {
       return MaybeLocal<Module>();
     }
   }
@@ -1023,7 +1032,8 @@ void Shell::DoHostImportModuleDynamically(void* import_data) {
   auto module_it = d->specifier_to_module_map.find(absolute_path);
   if (module_it != d->specifier_to_module_map.end()) {
     root_module = module_it->second.Get(isolate);
-  } else if (!FetchModuleTree(realm, absolute_path).ToLocal(&root_module)) {
+  } else if (!FetchModuleTree(Local<Module>(), realm, absolute_path)
+                  .ToLocal(&root_module)) {
     CHECK(try_catch.HasCaught());
     resolver->Reject(realm, try_catch.Exception()).ToChecked();
     return;
@@ -1090,7 +1100,8 @@ bool Shell::ExecuteModule(Isolate* isolate, const char* file_name) {
 
   Local<Module> root_module;
 
-  if (!FetchModuleTree(realm, absolute_path).ToLocal(&root_module)) {
+  if (!FetchModuleTree(Local<Module>(), realm, absolute_path)
+           .ToLocal(&root_module)) {
     CHECK(try_catch.HasCaught());
     ReportException(isolate, &try_catch);
     return false;
@@ -1210,6 +1221,7 @@ int PerIsolateData::HandleUnhandledPromiseRejections() {
     Shell::ReportException(isolate_, message, value);
   }
   unhandled_promises_.clear();
+  ignore_unhandled_promises_ = false;
   return static_cast<int>(i);
 }
 
@@ -1313,10 +1325,14 @@ void Shell::RealmOwner(const v8::FunctionCallbackInfo<v8::Value>& args) {
     Throw(args.GetIsolate(), "Invalid argument");
     return;
   }
-  int index = data->RealmFind(args[0]
-                                  ->ToObject(isolate->GetCurrentContext())
-                                  .ToLocalChecked()
-                                  ->CreationContext());
+  Local<Object> object =
+      args[0]->ToObject(isolate->GetCurrentContext()).ToLocalChecked();
+  i::Handle<i::JSReceiver> i_object = Utils::OpenHandle(*object);
+  if (i_object->IsJSGlobalProxy() &&
+      i::Handle<i::JSGlobalProxy>::cast(i_object)->IsDetached()) {
+    return;
+  }
+  int index = data->RealmFind(object->CreationContext());
   if (index == -1) return;
   args.GetReturnValue().Set(index);
 }
@@ -1529,7 +1545,7 @@ void Shell::LogGetAndStop(const v8::FunctionCallbackInfo<v8::Value>& args) {
 
   bool exists = false;
   raw_log = i::ReadFile(log_file, &exists, true);
-  fclose(log_file);
+  base::Fclose(log_file);
 
   if (!exists) {
     Throw(isolate, "Unable to read log file.");
@@ -2140,7 +2156,10 @@ Local<ObjectTemplate> Shell::CreateGlobalTemplate(Isolate* isolate) {
   global_template->Set(isolate, "performance",
                        Shell::CreatePerformanceTemplate(isolate));
   global_template->Set(isolate, "Worker", Shell::CreateWorkerTemplate(isolate));
-  global_template->Set(isolate, "os", Shell::CreateOSTemplate(isolate));
+  // Prevent fuzzers from creating side effects.
+  if (!i::FLAG_fuzzing) {
+    global_template->Set(isolate, "os", Shell::CreateOSTemplate(isolate));
+  }
   global_template->Set(isolate, "d8", Shell::CreateD8Template(isolate));
 
 #ifdef V8_FUZZILLI
@@ -2585,13 +2604,13 @@ static FILE* FOpen(const char* path, const char* mode) {
     return nullptr;
   }
 #else
-  FILE* file = fopen(path, mode);
+  FILE* file = base::Fopen(path, mode);
   if (file == nullptr) return nullptr;
   struct stat file_stat;
   if (fstat(fileno(file), &file_stat) != 0) return nullptr;
   bool is_regular_file = ((file_stat.st_mode & S_IFREG) != 0);
   if (is_regular_file) return file;
-  fclose(file);
+  base::Fclose(file);
   return nullptr;
 #endif
 }
@@ -2613,12 +2632,12 @@ static char* ReadChars(const char* name, int* size_out) {
   for (size_t i = 0; i < size;) {
     i += fread(&chars[i], 1, size - i, file);
     if (ferror(file)) {
-      fclose(file);
+      base::Fclose(file);
       delete[] chars;
       return nullptr;
     }
   }
-  fclose(file);
+  base::Fclose(file);
   *size_out = static_cast<int>(size);
   return chars;
 }
@@ -3571,7 +3590,6 @@ int Shell::RunMain(Isolate* isolate, bool last_run) {
       PerIsolateData::RealmScope realm_scope(PerIsolateData::Get(isolate));
       if (!options.isolate_sources[0].Execute(isolate)) success = false;
       if (!CompleteMessageLoop(isolate)) success = false;
-      if (!HandleUnhandledPromiseRejections(isolate)) success = false;
     }
     if (!use_existing_context) {
       DisposeModuleEmbedderData(context);
@@ -3603,6 +3621,9 @@ int Shell::RunMain(Isolate* isolate, bool last_run) {
     printf("%i pending unhandled Promise rejection(s) detected.\n",
            Shell::unhandled_promise_rejections_.load());
     success = false;
+    // RunMain may be executed multiple times, e.g. in REPRL mode, so we have to
+    // reset this counter.
+    Shell::unhandled_promise_rejections_.store(0);
   }
   // In order to finish successfully, success must be != expected_to_throw.
   return success == Shell::options.expected_to_throw ? 1 : 0;
@@ -3740,6 +3761,9 @@ class Serializer : public ValueSerializer::Delegate {
         serializer_(isolate, this),
         current_memory_usage_(0) {}
 
+  Serializer(const Serializer&) = delete;
+  Serializer& operator=(const Serializer&) = delete;
+
   Maybe<bool> WriteValue(Local<Context> context, Local<Value> value,
                          Local<Value> transfer) {
     bool ok;
@@ -3817,12 +3841,12 @@ class Serializer : public ValueSerializer::Delegate {
     current_memory_usage_ += size;
     if (current_memory_usage_ > kMaxSerializerMemoryUsage) return nullptr;
 
-    void* result = realloc(old_buffer, size);
+    void* result = base::Realloc(old_buffer, size);
     *actual_size = result ? size : 0;
     return result;
   }
 
-  void FreeBufferMemory(void* buffer) override { free(buffer); }
+  void FreeBufferMemory(void* buffer) override { base::Free(buffer); }
 
  private:
   Maybe<bool> PrepareTransfer(Local<Context> context, Local<Value> transfer) {
@@ -3887,8 +3911,6 @@ class Serializer : public ValueSerializer::Delegate {
   std::vector<Global<WasmModuleObject>> wasm_modules_;
   std::vector<std::shared_ptr<v8::BackingStore>> backing_stores_;
   size_t current_memory_usage_;
-
-  DISALLOW_COPY_AND_ASSIGN(Serializer);
 };
 
 class Deserializer : public ValueDeserializer::Delegate {
@@ -3899,6 +3921,9 @@ class Deserializer : public ValueDeserializer::Delegate {
         data_(std::move(data)) {
     deserializer_.SetSupportsLegacyWireFormat(true);
   }
+
+  Deserializer(const Deserializer&) = delete;
+  Deserializer& operator=(const Deserializer&) = delete;
 
   MaybeLocal<Value> ReadValue(Local<Context> context) {
     bool read_header;
@@ -3938,8 +3963,6 @@ class Deserializer : public ValueDeserializer::Delegate {
   Isolate* isolate_;
   ValueDeserializer deserializer_;
   std::unique_ptr<SerializationData> data_;
-
-  DISALLOW_COPY_AND_ASSIGN(Deserializer);
 };
 
 class D8Testing {

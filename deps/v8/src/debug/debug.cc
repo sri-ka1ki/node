@@ -47,6 +47,8 @@ class Debug::TemporaryObjectsTracker : public HeapObjectAllocationTracker {
  public:
   TemporaryObjectsTracker() = default;
   ~TemporaryObjectsTracker() override = default;
+  TemporaryObjectsTracker(const TemporaryObjectsTracker&) = delete;
+  TemporaryObjectsTracker& operator=(const TemporaryObjectsTracker&) = delete;
 
   void AllocationEvent(Address addr, int) override { objects_.insert(addr); }
 
@@ -80,7 +82,6 @@ class Debug::TemporaryObjectsTracker : public HeapObjectAllocationTracker {
  private:
   std::unordered_set<Address> objects_;
   base::Mutex mutex_;
-  DISALLOW_COPY_AND_ASSIGN(TemporaryObjectsTracker);
 };
 
 Debug::Debug(Isolate* isolate)
@@ -228,7 +229,7 @@ int BreakIterator::BreakIndexFromPosition(int source_position) {
 }
 
 void BreakIterator::Next() {
-  DisallowHeapAllocation no_gc;
+  DisallowGarbageCollection no_gc;
   DCHECK(!Done());
   bool first = break_index_ == -1;
   while (!Done()) {
@@ -393,14 +394,23 @@ char* Debug::RestoreDebug(char* storage) {
 
 int Debug::ArchiveSpacePerThread() { return sizeof(ThreadLocal); }
 
-void Debug::Iterate(RootVisitor* v) {
+void Debug::Iterate(RootVisitor* v) { Iterate(v, &thread_local_); }
+
+char* Debug::Iterate(RootVisitor* v, char* thread_storage) {
+  ThreadLocal* thread_local_data =
+      reinterpret_cast<ThreadLocal*>(thread_storage);
+  Iterate(v, thread_local_data);
+  return thread_storage + ArchiveSpacePerThread();
+}
+
+void Debug::Iterate(RootVisitor* v, ThreadLocal* thread_local_data) {
   v->VisitRootPointer(Root::kDebug, nullptr,
-                      FullObjectSlot(&thread_local_.return_value_));
+                      FullObjectSlot(&thread_local_data->return_value_));
   v->VisitRootPointer(Root::kDebug, nullptr,
-                      FullObjectSlot(&thread_local_.suspended_generator_));
+                      FullObjectSlot(&thread_local_data->suspended_generator_));
   v->VisitRootPointer(
       Root::kDebug, nullptr,
-      FullObjectSlot(&thread_local_.ignore_step_into_function_));
+      FullObjectSlot(&thread_local_data->ignore_step_into_function_));
 }
 
 DebugInfoListNode::DebugInfoListNode(Isolate* isolate, DebugInfo debug_info)
@@ -692,7 +702,7 @@ int Debug::FindBreakablePosition(Handle<DebugInfo> debug_info,
 }
 
 void Debug::ApplyBreakPoints(Handle<DebugInfo> debug_info) {
-  DisallowHeapAllocation no_gc;
+  DisallowGarbageCollection no_gc;
   if (debug_info->CanBreakAtEntry()) {
     debug_info->SetBreakAtEntry();
   } else {
@@ -722,7 +732,7 @@ void Debug::ClearBreakPoints(Handle<DebugInfo> debug_info) {
       return;
     }
 
-    DisallowHeapAllocation no_gc;
+    DisallowGarbageCollection no_gc;
     for (BreakIterator it(debug_info); !it.Done(); it.Next()) {
       it.ClearDebugBreak();
     }
@@ -800,7 +810,7 @@ void Debug::RecordWasmScriptWithBreakpoints(Handle<Script> script) {
         isolate_->global_handles()->Create(*new_list);
   }
   {
-    DisallowHeapAllocation no_gc;
+    DisallowGarbageCollection no_gc;
     for (int idx = wasm_scripts_with_breakpoints_->length() - 1; idx >= 0;
          --idx) {
       HeapObject wasm_script;
@@ -829,7 +839,7 @@ void Debug::ClearAllBreakPoints() {
   });
   // Clear all wasm breakpoints.
   if (!wasm_scripts_with_breakpoints_.is_null()) {
-    DisallowHeapAllocation no_gc;
+    DisallowGarbageCollection no_gc;
     for (int idx = wasm_scripts_with_breakpoints_->length() - 1; idx >= 0;
          --idx) {
       HeapObject raw_wasm_script;
@@ -1041,7 +1051,7 @@ void Debug::PrepareStep(StepAction step_action) {
   thread_local_.last_step_action_ = step_action;
 
   StackTraceFrameIterator frames_it(isolate_, frame_id);
-  StandardFrame* frame = frames_it.frame();
+  CommonFrame* frame = frames_it.frame();
 
   BreakLocation location = BreakLocation::Invalid();
   Handle<SharedFunctionInfo> shared;
@@ -1327,7 +1337,8 @@ void Debug::InstallDebugBreakTrampoline() {
         }
       } else if (obj.IsJSObject()) {
         JSObject object = JSObject::cast(obj);
-        DescriptorArray descriptors = object.map().instance_descriptors();
+        DescriptorArray descriptors =
+            object.map().instance_descriptors(kRelaxedLoad);
 
         for (InternalIndex i : object.map().IterateOwnDescriptors()) {
           if (descriptors.GetDetails(i).kind() == PropertyKind::kAccessor) {
@@ -1518,7 +1529,7 @@ class SharedFunctionInfoFinder {
   JSFunction current_candidate_closure_;
   int current_start_position_;
   int target_position_;
-  DisallowHeapAllocation no_gc_;
+  DISALLOW_GARBAGE_COLLECTION(no_gc_)
 };
 
 
@@ -1556,7 +1567,7 @@ Handle<Object> Debug::FindSharedFunctionInfoInScript(Handle<Script> script,
         // be no JSFunction referencing it. We can anticipate creating a debug
         // info while bypassing PrepareFunctionForDebugExecution.
         if (iteration > 1) {
-          AllowHeapAllocation allow_before_return;
+          AllowGarbageCollection allow_before_return;
           CreateBreakInfo(shared_handle);
         }
         return shared_handle;
@@ -1703,7 +1714,8 @@ void Debug::FreeDebugInfoListNode(DebugInfoListNode* prev,
   // Pack script back into the
   // SFI::script_or_debug_info field.
   Handle<DebugInfo> debug_info(node->debug_info());
-  debug_info->shared().set_script_or_debug_info(debug_info->script());
+  debug_info->shared().set_script_or_debug_info(debug_info->script(),
+                                                kReleaseStore);
 
   delete node;
 }
@@ -1969,7 +1981,7 @@ bool Debug::ShouldBeSkipped() {
   DisableBreak no_recursive_break(this);
 
   StackTraceFrameIterator iterator(isolate_);
-  StandardFrame* frame = iterator.frame();
+  CommonFrame* frame = iterator.frame();
   FrameSummary summary = FrameSummary::GetTop(frame);
   Handle<Object> script_obj = summary.script();
   if (!script_obj->IsScript()) return false;
@@ -2135,7 +2147,7 @@ void Debug::PrintBreakLocation() {
   HandleScope scope(isolate_);
   StackTraceFrameIterator iterator(isolate_);
   if (iterator.done()) return;
-  StandardFrame* frame = iterator.frame();
+  CommonFrame* frame = iterator.frame();
   FrameSummary summary = FrameSummary::GetTop(frame);
   summary.EnsureSourcePositionsAvailable();
   int source_position = summary.SourcePosition();
@@ -2155,7 +2167,7 @@ void Debug::PrintBreakLocation() {
                                  isolate_);
     int line_start = line == 0 ? 0 : Smi::ToInt(line_ends->get(line - 1)) + 1;
     int line_end = Smi::ToInt(line_ends->get(line));
-    DisallowHeapAllocation no_gc;
+    DisallowGarbageCollection no_gc;
     String::FlatContent content = source->GetFlatContent(no_gc);
     if (content.IsOneByte()) {
       PrintF("[debug] %.*s\n", line_end - line_start,
@@ -2334,7 +2346,7 @@ bool Debug::PerformSideEffectCheck(Handle<JSFunction> function,
     case DebugInfo::kHasSideEffects:
       if (FLAG_trace_side_effect_free_debug_evaluate) {
         PrintF("[debug-evaluate] Function %s failed side effect check.\n",
-               function->shared().DebugName().ToCString().get());
+               function->shared().DebugNameCStr().get());
       }
       side_effect_check_failed_ = true;
       // Throw an uncatchable termination exception.

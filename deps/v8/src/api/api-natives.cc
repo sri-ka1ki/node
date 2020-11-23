@@ -357,11 +357,12 @@ void UncacheTemplateInstantiation(Isolate* isolate,
 
 bool IsSimpleInstantiation(Isolate* isolate, ObjectTemplateInfo info,
                            JSReceiver new_target) {
-  DisallowHeapAllocation no_gc;
+  DisallowGarbageCollection no_gc;
 
   if (!new_target.IsJSFunction()) return false;
   JSFunction fun = JSFunction::cast(new_target);
-  if (fun.shared().function_data() != info.constructor()) return false;
+  if (fun.shared().function_data(kAcquireLoad) != info.constructor())
+    return false;
   if (info.immutable_proto()) return false;
   return fun.context().native_context() == isolate->raw_native_context();
 }
@@ -652,8 +653,7 @@ Handle<JSFunction> ApiNatives::CreateApiFunction(
   DCHECK(shared->HasSharedName());
 
   Handle<JSFunction> result =
-      isolate->factory()->NewFunctionFromSharedFunctionInfo(shared,
-                                                            native_context);
+      Factory::JSFunctionBuilder{isolate, shared, native_context}.Build();
 
   if (obj->remove_prototype()) {
     DCHECK(prototype.is_null());
